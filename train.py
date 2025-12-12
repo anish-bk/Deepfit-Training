@@ -22,7 +22,7 @@ from utils import (
 from virtual_try_on_dataloader import get_train_val_loaders
 
 # ---------------------------------
-# Train DeepFit (SD3-ControlNet) with W&B logging
+# Train DeepFit (SD1.5 Inpainting + ControlNet) with W&B logging
 # ---------------------------------
 
 # Hard‐coded W&B key (or pull from env)
@@ -89,7 +89,7 @@ def main():
                 "seed": args.seed,
                 "categories": args.categories
             },
-            "tags": ["sd3", "controlnet", "virtual-tryon"]
+            "tags": ["sd15", "controlnet", "virtual-tryon", "inpainting"]
         }
     use_wandb = setup_wandb(wandb_cfg)
 

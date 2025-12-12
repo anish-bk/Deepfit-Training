@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inference with DeepFit (SD3-ControlNet) - image-only latents")
+    parser = argparse.ArgumentParser(description="Inference with DeepFit (SD1.5 Inpainting + ControlNet) - image-only latents")
     parser.add_argument("--checkpoint_step", type=int, required=True, help="Checkpoint step to load")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for checkpoints")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference")
@@ -28,10 +28,10 @@ def parse_args():
     parser.add_argument("--clothing_path", type=str, required=True, help="Path to clothing image")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
 
-    parser.add_argument("--height", type=int, default=1024, help="Height for inference")
-    parser.add_argument("--width", type=int, default=1024, help="Width for inference")
-    parser.add_argument("--guidance_scale", type=float, default=7.0, help="Classifier-free guidance scale")
-    parser.add_argument("--num_inference_steps", type=int, default=28, help="Number of scheduler timesteps")
+    parser.add_argument("--height", type=int, default=512, help="Height for inference")
+    parser.add_argument("--width", type=int, default=512, help="Width for inference")
+    parser.add_argument("--guidance_scale", type=float, default=7.5, help="Classifier-free guidance scale")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of scheduler timesteps")
     parser.add_argument("--debug", action="store_true", help="Enable debug prints")
     return parser.parse_args()
 
@@ -70,10 +70,10 @@ def main():
     model = DeepFit(
         device=device,
         debug=args.debug,
-        transformer_in_channels=16,
-        transformer_out_channels=16,
-        controlnet_in_latent_channels=16,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     ).to(device)
     model.eval()
     logger.info("Model instantiated (16-channel latents) in eval mode.")

@@ -60,10 +60,10 @@ def test_latent_discriminator_with_real_model():
     teacher = DeepFit(
         device=str(device),
         debug=False,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     teacher.to(device)
     teacher.eval()
@@ -76,12 +76,12 @@ def test_latent_discriminator_with_real_model():
     # We choose dummy spatial resolution H=W=256 for images, so latent spatial dims h8=w8=32
     H_img, W_img = 256, 256
     h8, w8 = H_img // 8, W_img // 8  # typically 32
-    # Dummy noisy_latents: [B,20,h8,w8]
-    noisy_latents = torch.randn((B, 20, h8, w8), device=device, dtype=torch.float16)
-    # For prompt_embeds and pooled_prompt: use teacher._encode_prompt
+    # Dummy noisy_latents: [B,4,h8,w8] for SD1.5
+    noisy_latents = torch.randn((B, 4, h8, w8), device=device, dtype=torch.float16)
+    # For prompt_embeds: use encode_prompt
     prompts = ["test prompt"] * B
     with torch.no_grad():
-        prompt_embeds, pooled_prompt = teacher._encode_prompt(prompts)
+        prompt_embeds = teacher._encode_prompt(prompts)
     # control_input: use teacher._prepare_control_input with dummy person/clothing
     # Need dummy person_image [B,3,H_img,W_img], mask [B,1,H_img,W_img], clothing_image [B,3,H_img,W_img]
     person = torch.rand((B,3,H_img,W_img), device=device, dtype=torch.float32)
@@ -90,12 +90,12 @@ def test_latent_discriminator_with_real_model():
     with torch.no_grad():
         control_input = teacher._prepare_control_input(person, mask, clothing)
     logger.info(f"Dummy inputs shapes for discriminator: noisy_latents {noisy_latents.shape}, "
-                f"prompt_embeds {prompt_embeds.shape}, pooled_prompt {pooled_prompt.shape}, "
+                f"prompt_embeds {prompt_embeds.shape}, "
                 f"control_input {control_input.shape}")
 
     # Forward through discriminator; it will print intermediate shapes inside
     logger.info("Running LatentDiscriminator forward pass...")
-    scores = disc(noisy_latents, prompt_embeds, pooled_prompt, control_input)
+    scores = disc(noisy_latents, prompt_embeds, control_input)
     logger.info(f"LatentDiscriminator output scores shape: {scores.shape} (expected [B,1])")
 
 def test_wrapper_train_step_with_real_model():
@@ -108,14 +108,14 @@ def test_wrapper_train_step_with_real_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Testing LADDDistillationWrapper.train_step on device: {device}")
 
-    # Instantiate student and teacher DeepFit models
+    # Instantiate student and teacher DeepFit models (SD1.5 config)
     student = DeepFit(
         device=str(device),
         debug=False,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     student.to(device)
     student.eval()
@@ -123,10 +123,10 @@ def test_wrapper_train_step_with_real_model():
     teacher = DeepFit(
         device=str(device),
         debug=False,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     teacher.load_state_dict(student.state_dict())
     teacher.to(device)

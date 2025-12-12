@@ -2,10 +2,10 @@
 
 import torch
 import torch.nn as nn
-from diffusers import AutoencoderKL, SD3Transformer2DModel, SD3ControlNetModel, FlowMatchEulerDiscreteScheduler
-from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel, DDPMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
 
-from utils import modify_transformer_channels, modify_controlnet_channels  # remove freeze_non_trainable_components
+from utils import modify_unet_channels, modify_controlnet_channels  # remove freeze_non_trainable_components
 
 # class DeepFit(nn.Module):
 #     """
@@ -261,17 +261,17 @@ from utils import modify_transformer_channels, modify_controlnet_channels  # rem
 
 class DeepFit(nn.Module):
     """
-    DeepFit model: loads VAE, SD3 Transformer & ControlNet.
+    DeepFit model: loads VAE, UNet & ControlNet for SD1.5 Inpainting.
     Assumes prompt embeddings are provided by the dataset, so no tokenizers or text encoders are needed here.
     """
     def __init__(
         self,
         device: str = "cuda",
         debug: bool = False,
-        transformer_in_channels: int = 20,
-        transformer_out_channels: int = 20,
-        controlnet_in_latent_channels: int = 20,
-        controlnet_cond_channels: int = 33
+        unet_in_channels: int = 13,  # SD1.5 inpainting: 4 latent + 4 masked latent + 1 mask + 4 clothing latent = 13
+        unet_out_channels: int = 4,
+        controlnet_in_channels: int = 13,
+        controlnet_cond_channels: int = 9  # person latent (4) + mask (1) + clothing latent (4)
     ):
         super().__init__()
         self.device = device
@@ -281,41 +281,35 @@ class DeepFit(nn.Module):
         if debug:
             print("[DEBUG] Loading VAE...")
         self.vae = AutoencoderKL.from_pretrained(
-            "stabilityai/stable-diffusion-3-medium-diffusers",
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
             subfolder="vae",
             torch_dtype=torch.float16
         ).to(device)
 
-        # 2. Load and modify Transformer
+        # 2. Load and modify UNet
         if debug:
-            print("[DEBUG] Loading and modifying Transformer...")
-        orig_tr = SD3Transformer2DModel.from_pretrained(
-            "stabilityai/stable-diffusion-3-medium-diffusers",
-            subfolder="transformer",
+            print("[DEBUG] Loading and modifying UNet...")
+        orig_unet = UNet2DConditionModel.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
+            subfolder="unet",
             torch_dtype=torch.float16
         ).to(device)
-        self.transformer = modify_transformer_channels(
-            transformer=orig_tr,
-            new_in_channels=transformer_in_channels,
-            new_out_channels=transformer_out_channels,
+        self.unet = modify_unet_channels(
+            unet=orig_unet,
+            new_in_channels=unet_in_channels,
             device=device
         )
 
         # 3. Load and modify ControlNet
         if debug:
             print("[DEBUG] Loading and modifying ControlNet...")
-        orig_cn = SD3ControlNetModel.from_pretrained(
-            "alimama-creative/SD3-Controlnet-Inpainting",
-            use_safetensors=True,
-            extra_conditioning_channels=1,
-            torch_dtype=torch.float16,
-            ignore_mismatched_sizes=True,
-            low_cpu_mem_usage=False
+        orig_cn = ControlNetModel.from_pretrained(
+            "lllyasviel/control_v11p_sd15_inpaint",
+            torch_dtype=torch.float16
         ).to(device)
         self.controlnet = modify_controlnet_channels(
             controlnet=orig_cn,
-            in_channels_latent=controlnet_in_latent_channels,
-            new_in_channels_cond=controlnet_cond_channels,
+            new_in_channels=controlnet_cond_channels,
             device=device
         )
 
@@ -325,16 +319,16 @@ class DeepFit(nn.Module):
         for _, p in self.named_parameters():
             p.requires_grad = False
 
-        # Unfreeze Transformer patch embed and attention/norm layers
-        for n, p in self.transformer.named_parameters():
-            if "pos_embed.proj" in n or (".transformer_blocks." in n and (".attn." in n or ".norm1" in n or ".norm1_context" in n or "norm_out.linear" in n)):
+        # Unfreeze UNet input conv and attention layers
+        for n, p in self.unet.named_parameters():
+            if "conv_in" in n or ".attentions." in n or ".attn" in n:
                 p.requires_grad = True
                 if debug:
-                    print(f"[DEBUG] Unfrozen transformer param: {n}")
+                    print(f"[DEBUG] Unfrozen unet param: {n}")
 
-        # Unfreeze ControlNet patch embed and attention layers
+        # Unfreeze ControlNet input conv and attention layers
         for n, p in self.controlnet.named_parameters():
-            if "pos_embed.proj" in n or "pos_embed_input.proj" in n or "controlnet_blocks" or (".transformer_blocks." in n and ".attn." in n):
+            if "conv_in" in n or "controlnet_cond_embedding" in n or ".attentions." in n or ".attn" in n:
                 p.requires_grad = True
                 if debug:
                     print(f"[DEBUG] Unfrozen controlnet param: {n}")
@@ -342,8 +336,8 @@ class DeepFit(nn.Module):
         # 5. Scheduler for inference
         if debug:
             print("[DEBUG] Loading Scheduler...")
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-3-medium-diffusers",
+        self.scheduler = DDPMScheduler.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
             subfolder="scheduler"
         )
 
@@ -353,35 +347,36 @@ class DeepFit(nn.Module):
         timesteps: torch.Tensor,
         control_input: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        pooled_prompt: torch.Tensor
+        pooled_prompt: torch.Tensor = None  # Not used for SD1.5 but kept for compatibility
     ) -> torch.Tensor:
         """
-        Forward pass: apply ControlNet then Transformer to predict the added noise.
+        Forward pass: apply ControlNet then UNet to predict the added noise.
         Inputs:
           - noisy_latents: [B, latent_C, h/8, w/8]
           - timesteps:     [B]
           - control_input: [B, cond_C, h/8, w/8]
           - prompt_embeds: [B, seq_len, dim]
-          - pooled_prompt: [B, 2048]
+          - pooled_prompt: Not used for SD1.5
         Returns:
           - model_pred:   [B, latent_C, h/8, w/8]
         """
-        control_block = self.controlnet(
-            hidden_states=noisy_latents,
+        # ControlNet forward
+        down_block_res_samples, mid_block_res_sample = self.controlnet(
+            sample=noisy_latents,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
-            pooled_projections=pooled_prompt,
             controlnet_cond=control_input,
-            conditioning_scale=2.0,
+            conditioning_scale=1.0,
             return_dict=False
-        )[0]
+        )
 
-        model_pred = self.transformer(
-            hidden_states=noisy_latents,
+        # UNet forward with ControlNet residuals
+        model_pred = self.unet(
+            sample=noisy_latents,
             timestep=timesteps,
             encoder_hidden_states=prompt_embeds,
-            pooled_projections=pooled_prompt,
-            block_controlnet_hidden_states=control_block,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
             return_dict=False
         )[0]
 

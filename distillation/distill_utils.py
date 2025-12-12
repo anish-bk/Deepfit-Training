@@ -15,37 +15,22 @@ logging.basicConfig(level=logging.INFO)
 
 class LatentDiscriminator(nn.Module):
     """
-    Multi-scale latent-space discriminator that extracts features from multiple transformer blocks
-    of the teacher model, applies small projection heads, and aggregates them to produce a scalar score per sample.
-    Requires that DeepFit.transformer supports return_dict=True and output_hidden_states=True,
-    returning hidden_states as a tuple/list of feature maps [B, C, H, W] per block.
+    Latent-space discriminator that extracts features from the UNet
+    of the teacher model, applies projection heads, and produces a scalar score per sample.
+    For SD1.5, we use the UNet output directly as features.
     """
     def __init__(self, teacher: DeepFit, feature_layers: list = None, proj_hidden_dim: int = 128):
         """
-        teacher: the teacher DeepFit model whose transformer we extract features from.
-        feature_layers: indices of transformer blocks from which to extract features. If None, pick defaults.
+        teacher: the teacher DeepFit model whose UNet we extract features from.
+        feature_layers: indices of layers to extract features from. For SD1.5 UNet, we use [0] by default.
         proj_hidden_dim: hidden dimension for projection heads.
         """
         super().__init__()
         self.teacher = teacher
-        # Determine number of transformer blocks
-        # Attempt to infer from transformer structure:
-        # Many HF Transformer2DModels have .transformer_blocks or .blocks or similar.
-        if hasattr(self.teacher.transformer, "transformer_blocks"):
-            num_blocks = len(self.teacher.transformer.transformer_blocks)
-        elif hasattr(self.teacher.transformer, "blocks"):
-            num_blocks = len(self.teacher.transformer.blocks)
-        else:
-            # Try config
-            num_blocks = getattr(self.teacher.transformer.config, "num_hidden_layers", None)
-            if num_blocks is None:
-                raise RuntimeError("Cannot determine number of transformer blocks for LatentDiscriminator.")
-        # Select feature layers
+        # For SD1.5 UNet, we use the output as a single feature layer
+        # Select feature layers - for SD1.5 we just use the output
         if feature_layers is None:
-            if num_blocks >= 3:
-                feature_layers = [num_blocks // 4, num_blocks // 2, (3 * num_blocks) // 4]
-            else:
-                feature_layers = list(range(num_blocks))
+            feature_layers = [0]  # Just use the UNet output
         self.feature_layers = feature_layers
 
         self.proj_hidden_dim = proj_hidden_dim
@@ -54,36 +39,48 @@ class LatentDiscriminator(nn.Module):
         self.initialized = False
 
     def _init_heads(self, sample_latent: torch.Tensor,
-                    prompt_embeds: torch.Tensor, pooled_prompt: torch.Tensor, control_input: torch.Tensor):
+                    prompt_embeds: torch.Tensor, control_input: torch.Tensor):
         """
-        Initialize projection heads by doing a forward pass through teacher.transformer
-        with return_dict=True, output_hidden_states=True, to inspect feature shapes.
-        sample_latent: [B, C_latent, H, W], e.g. [B,20,h/8,w/8]
-        prompt_embeds, pooled_prompt, control_input: from encoding actual batch, used for shape inference.
+        Initialize projection heads by doing a forward pass through teacher.unet
+        to inspect feature shapes.
+        sample_latent: [B, C_latent, H, W], e.g. [B,4,h/8,w/8] for SD1.5
+        prompt_embeds: [B, seq_len, dim]
+        control_input: [B, cond_C, h/8, w/8]
         """
         device = sample_latent.device
         B = sample_latent.shape[0]
         # Create dummy timesteps tensor (zeros)
-        t_dummy = torch.zeros(B, device=device)
-        # Forward through teacher.transformer
+        t_dummy = torch.zeros(B, device=device, dtype=torch.long)
+        # Forward through teacher.unet
         try:
-            outputs = self.teacher.transformer(
-                hidden_states=sample_latent,
+            # Get ControlNet outputs first
+            down_block_res_samples, mid_block_res_sample = self.teacher.controlnet(
+                sample=sample_latent,
                 timestep=t_dummy,
                 encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt,
-                block_controlnet_hidden_states=control_input,
-                return_dict=True,
-                output_hidden_states=True
+                controlnet_cond=control_input,
+                conditioning_scale=1.0,
+                return_dict=False
             )
-            hidden_states = outputs.hidden_states  # tuple length num_blocks+1 or similar
+            # UNet forward
+            outputs = self.teacher.unet(
+                sample=sample_latent,
+                timestep=t_dummy,
+                encoder_hidden_states=prompt_embeds,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
+                return_dict=False
+            )
+            # Use the output as feature for discriminator
+            hidden_states = [outputs[0]]  # [B, C, H, W]
         except Exception as e:
-            raise RuntimeError(f"Transformer forward with output_hidden_states failed: {e}")
+            raise RuntimeError(f"UNet forward failed: {e}")
 
         # For each selected layer, inspect shape and create projection head
         for idx in self.feature_layers:
             if idx >= len(hidden_states):
-                raise IndexError(f"Selected feature layer index {idx} >= available hidden states {len(hidden_states)}")
+                # Skip if layer index exceeds available hidden states
+                continue
             feat = hidden_states[idx]  # [B, C, H, W]
             C = feat.shape[1]
             # Projection head: global average pooling -> Linear(C, proj_hidden_dim) -> LeakyReLU -> Linear(proj_hidden_dim,1)
@@ -99,52 +96,68 @@ class LatentDiscriminator(nn.Module):
         logger.info(f"[LatentDiscriminator] Initialized projection heads for layers {self.feature_layers}")
 
     def forward(self, noisy_latents: torch.Tensor,
-                prompt_embeds: torch.Tensor, pooled_prompt: torch.Tensor, control_input: torch.Tensor):
+                prompt_embeds: torch.Tensor, control_input: torch.Tensor, pooled_prompt: torch.Tensor = None):
         """
-        noisy_latents: [B, C_latent, H, W], e.g. [B,20,h/8,w/8]
-        prompt_embeds, pooled_prompt, control_input: needed for teacher.transformer forward
+        noisy_latents: [B, C_latent, H, W], e.g. [B,4,h/8,w/8] for SD1.5
+        prompt_embeds: [B, seq_len, dim]
+        control_input: [B, cond_C, h/8, w/8]
+        pooled_prompt: Not used for SD1.5 but kept for compatibility
         Returns: scores: [B, 1], discriminator score per sample.
         """
         if not self.initialized:
             # Initialize projection heads on first batch
-            self._init_heads(noisy_latents, prompt_embeds, pooled_prompt, control_input)
+            self._init_heads(noisy_latents, prompt_embeds, control_input)
 
-        # Forward through teacher.transformer to get hidden states
+        # Forward through teacher.unet to get hidden states
         with torch.no_grad():
             B = noisy_latents.shape[0]
-            t_dummy = torch.zeros(B, device=noisy_latents.device)
+            t_dummy = torch.zeros(B, device=noisy_latents.device, dtype=torch.long)
             try:
-                outputs = self.teacher.transformer(
-                    hidden_states=noisy_latents,
+                # Get ControlNet outputs first
+                down_block_res_samples, mid_block_res_sample = self.teacher.controlnet(
+                    sample=noisy_latents,
                     timestep=t_dummy,
                     encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt,
-                    block_controlnet_hidden_states=control_input,
-                    return_dict=True,
-                    output_hidden_states=True
+                    controlnet_cond=control_input,
+                    conditioning_scale=1.0,
+                    return_dict=False
                 )
-                hidden_states = outputs.hidden_states
+                # UNet forward
+                outputs = self.teacher.unet(
+                    sample=noisy_latents,
+                    timestep=t_dummy,
+                    encoder_hidden_states=prompt_embeds,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                    return_dict=False
+                )
+                # Use the output as hidden states for discriminator
+                hidden_states = [outputs[0]]
             except Exception as e:
-                raise RuntimeError(f"Transformer forward with output_hidden_states failed: {e}")
+                raise RuntimeError(f"UNet forward failed: {e}")
 
         # For each selected layer, apply projection head
         scores = []
         for idx in self.feature_layers:
-            feat = hidden_states[idx]  # [B, C, H, W]
-            head = self.proj_heads[str(idx)]
-            out = head(feat)  # [B,1]
-            scores.append(out)
+            if idx < len(hidden_states):
+                feat = hidden_states[idx]  # [B, C, H, W]
+                head = self.proj_heads[str(idx)]
+                out = head(feat)  # [B,1]
+                scores.append(out)
         # Aggregate: mean across heads
-        scores = torch.stack(scores, dim=0)  # [num_layers, B,1]
-        scores = scores.mean(dim=0)          # [B,1]
+        if len(scores) > 0:
+            scores = torch.stack(scores, dim=0)  # [num_layers, B,1]
+            scores = scores.mean(dim=0)          # [B,1]
+        else:
+            scores = torch.zeros(noisy_latents.shape[0], 1, device=noisy_latents.device)
         return scores  # [B,1]
 
 
 class ConsistencySampler:
     """
-    Samples noisy latents at sigma_max, passes through student transformer to get predictions,
+    Samples noisy latents at sigma_max, passes through student UNet to get predictions,
     used for consistency loss.
-    Works on full latents (image+depth+normals), e.g., 20 channels.
+    Works on latents, e.g., 4 channels for SD1.5.
     """
     def __init__(self, model: DeepFit, sigma_min: float = 0.002, sigma_max: float = 80.0):
         """
@@ -156,21 +169,32 @@ class ConsistencySampler:
         self.sigma_max = sigma_max
 
     def __call__(self, latents: torch.Tensor, prompt_embeds: torch.Tensor,
-                 pooled_prompt: torch.Tensor, control_input: torch.Tensor) -> torch.Tensor:
+                 control_input: torch.Tensor, pooled_prompt: torch.Tensor = None) -> torch.Tensor:
         """
-        latents: [B, 20, h/8, w/8] image+depth+normals latents
-        prompt_embeds, pooled_prompt: from model._encode_prompt
-        control_input: [B,33,h/8,w/8]
-        Returns predicted noise for latents at sigma_max: [B,20,h/8,w/8]
+        latents: [B, 4, h/8, w/8] latents for SD1.5
+        prompt_embeds: [B, seq_len, dim]
+        control_input: [B, cond_C, h/8, w/8]
+        pooled_prompt: Not used for SD1.5
+        Returns predicted noise for latents at sigma_max: [B, 4, h/8, w/8]
         """
         noisy_latents = latents + self.sigma_max * torch.randn_like(latents)
         with torch.no_grad():
-            pred = self.model.transformer(
-                hidden_states=noisy_latents,
-                timestep=torch.tensor([self.sigma_max] * noisy_latents.shape[0], device=latents.device),
+            # ControlNet forward
+            down_block_res_samples, mid_block_res_sample = self.model.controlnet(
+                sample=noisy_latents,
+                timestep=torch.tensor([int(self.sigma_max)] * noisy_latents.shape[0], device=latents.device, dtype=torch.long),
                 encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_prompt,
-                block_controlnet_hidden_states=control_input,
+                controlnet_cond=control_input,
+                conditioning_scale=1.0,
+                return_dict=False
+            )
+            # UNet forward
+            pred = self.model.unet(
+                sample=noisy_latents,
+                timestep=torch.tensor([int(self.sigma_max)] * noisy_latents.shape[0], device=latents.device, dtype=torch.long),
+                encoder_hidden_states=prompt_embeds,
+                down_block_additional_residuals=down_block_res_samples,
+                mid_block_additional_residual=mid_block_res_sample,
                 return_dict=False
             )[0]
         return pred
@@ -195,10 +219,10 @@ class LADDDistillationWrapper(nn.Module):
             teacher = DeepFit(
                 device=self.student.device,
                 debug=self.student.debug,
-                transformer_in_channels=20,
-                transformer_out_channels=20,
-                controlnet_in_latent_channels=20,
-                controlnet_cond_channels=33
+                unet_in_channels=13,
+                unet_out_channels=4,
+                controlnet_in_channels=13,
+                controlnet_cond_channels=9
             ).to(self.student.device)
             teacher.load_state_dict(self.student.state_dict())
             teacher.eval()

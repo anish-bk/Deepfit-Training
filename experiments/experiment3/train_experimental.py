@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train DeepFit (SD3-ControlNet) for Virtual Try-On (image-only latents)"
+        description="Train DeepFit (SD1.5 Inpainting + ControlNet) for Virtual Try-On"
     )
     parser.add_argument("--data_root", type=str, required=True, help="Root directory for dataset")
     parser.add_argument("--device", type=str, default="cuda", help="Device: cuda or cpu")
@@ -73,7 +73,7 @@ def main():
                 "seed": args.seed,
                 "val_fraction": args.val_fraction,
             },
-            "tags": ["sd3", "controlnet", "virtual-tryon", "image-only-latents"]
+            "tags": ["sd15", "controlnet", "virtual-tryon", "inpainting"]
         }
     use_wandb = setup_wandb(wandb_config)
 
@@ -99,14 +99,14 @@ def main():
         return
     logger.info(f"Obtained train loader with {len(train_loader)} batches and val loader with {len(val_loader)} batches.")
 
-    # Model instantiation (16-channel latents)
+    # Model instantiation (SD1.5 4-channel latents)
     model = DeepFit(
         device=device,
         debug=args.debug,
-        transformer_in_channels=16,
-        transformer_out_channels=16,
-        controlnet_in_latent_channels=16,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     ).to(device)
     model.train()
     logger.info("Model instantiated and set to train mode.")

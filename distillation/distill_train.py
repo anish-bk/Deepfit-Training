@@ -100,22 +100,22 @@ def main():
     )
     logger.info(f"Dataset loaded: {len(dataset)} samples. Batch size: {args.batch_size}")
 
-    # Instantiate student and teacher models (20-channel latents)
+    # Instantiate student and teacher models (SD1.5 4-channel latents)
     student = DeepFit(
         device=str(device),
         debug=args.debug,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     teacher = DeepFit(
         device=str(device),
         debug=args.debug,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     teacher.load_state_dict(student.state_dict())
     teacher.eval()

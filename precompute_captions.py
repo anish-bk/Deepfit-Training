@@ -1,4 +1,4 @@
-#Datapipeline for precomputing caption embeddings for Stable Diffusion 3 Medium
+#Datapipeline for precomputing caption embeddings for Stable Diffusion 1.5 Inpainting
 
 
 
@@ -9,7 +9,7 @@ import os
 import torch.nn as nn
 import numpy as np
 import torch
-from transformers import CLIPTokenizer, CLIPTextModelWithProjection, T5TokenizerFast, T5EncoderModel
+from transformers import CLIPTokenizer, CLIPTextModel
 from utils import encode_prompt
 
 # adjust these paths & batch size as needed
@@ -21,36 +21,14 @@ torch.cuda.empty_cache()
 
 model = nn.Identity()
 
-tokenizer1 = CLIPTokenizer.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
+tokenizer = CLIPTokenizer.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
             subfolder="tokenizer"
         )
 
-text_encoder1 = CLIPTextModelWithProjection.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
+text_encoder = CLIPTextModel.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
             subfolder="text_encoder",
-            torch_dtype=torch.float16
-        ).to(device)
-
-tokenizer2 = CLIPTokenizer.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
-            subfolder="tokenizer_2"
-        )
-
-text_encoder2 = CLIPTextModelWithProjection.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
-            subfolder="text_encoder_2",
-            torch_dtype=torch.float16
-        ).to(device)
-
-tokenizer3 = T5TokenizerFast.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
-            subfolder="tokenizer_3"
-        )
-
-text_encoder3 = T5EncoderModel.from_pretrained(
-            "D:\\PUL - DeepFit\\Training\\stable-diffusion-3-medium-diffusers",
-            subfolder="text_encoder_3",
             torch_dtype=torch.float16
         ).to(device)
 
@@ -74,34 +52,29 @@ for part in os.listdir(ROOT):
             captions.append(f.read().strip())
 
     # batch‑encode
-    pes, pps = [], []
+    pes = []
     for i in range(0, len(captions), BATCH_SIZE):
         batch = captions[i : i + BATCH_SIZE]
-        pe, pp = encode_prompt(
+        pe = encode_prompt(
             model,
-            tokenizer1, text_encoder1,
-            tokenizer2, text_encoder2,
-            tokenizer3, text_encoder3,
+            tokenizer, text_encoder,
             batch,
             device,
             debug=False,
         )
         pe = pe.detach().cpu().half().numpy()
-        pp = pp.detach().cpu().half().numpy()
         pes.append(pe)
-        pps.append(pp)
 
     # concatenate
     all_pe = np.concatenate(pes, axis=0)
-    all_pp = np.concatenate(pps, axis=0)
 
     # make caption_embeds folder
     embed_dir = os.path.join(part_dir, "caption_embeds")
     os.makedirs(embed_dir, exist_ok=True)
 
-    # save .npz
+    # save .npz (no pooled_prompt for SD1.5)
     out_path = os.path.join(embed_dir, "precomputed_prompts.npz")
-    np.savez_compressed(out_path, pe=all_pe, pp=all_pp, names=np.array(names))
+    np.savez_compressed(out_path, pe=all_pe, names=np.array(names))
 
     
 

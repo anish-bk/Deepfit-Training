@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inference with DeepFit (SD3-ControlNet)")
+    parser = argparse.ArgumentParser(description="Inference with DeepFit (SD1.5 Inpainting + ControlNet)")
     parser.add_argument("--checkpoint_step", type=int, required=True, help="Checkpoint step to load")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints", help="Directory for checkpoints")
     parser.add_argument("--device", type=str, default="cuda", help="Device for inference")
@@ -26,10 +26,10 @@ def parse_args():
     parser.add_argument("--mask_path", type=str, required=True, help="Path to mask image (grayscale)")
     parser.add_argument("--clothing_path", type=str, required=True, help="Path to clothing image")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for generation")
-    parser.add_argument("--height", type=int, default=1024, help="Height for inference")
-    parser.add_argument("--width", type=int, default=1024, help="Width for inference")
-    parser.add_argument("--guidance_scale", type=float, default=7.0, help="Classifier-free guidance scale")
-    parser.add_argument("--num_inference_steps", type=int, default=28, help="Number of scheduler timesteps")
+    parser.add_argument("--height", type=int, default=512, help="Height for inference")
+    parser.add_argument("--width", type=int, default=512, help="Width for inference")
+    parser.add_argument("--guidance_scale", type=float, default=7.5, help="Classifier-free guidance scale")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of scheduler timesteps")
     parser.add_argument("--debug", action="store_true", help="Enable debug prints")
     return parser.parse_args()
 
@@ -79,6 +79,18 @@ def main():
         logger.error(f"Failed to load checkpoint: {e}")
         return
 
+    # Load tokenizer and text encoder for prompt encoding
+    from transformers import CLIPTokenizer, CLIPTextModel
+    tokenizer = CLIPTokenizer.from_pretrained(
+        "stable-diffusion-v1-5/stable-diffusion-inpainting",
+        subfolder="tokenizer"
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        "stable-diffusion-v1-5/stable-diffusion-inpainting",
+        subfolder="text_encoder",
+        torch_dtype=torch.float16
+    ).to(device)
+
     # Load inputs
     logger.info("Loading input images...")
     person = load_image_as_tensor(args.person_path, device=device)      # [3,H,W]
@@ -100,31 +112,23 @@ def main():
 
     # Encode conditional and unconditional prompts
     logger.info("Encoding conditional prompt...")
-    prompt_embeds, pooled_prompt = encode_prompt(
+    prompt_embeds = encode_prompt(
         model=model,
-        tokenizer1=model.tokenizer1,
-        text_encoder1=model.text_encoder1,
-        tokenizer2=model.tokenizer2,
-        text_encoder2=model.text_encoder2,
-        tokenizer3=model.tokenizer3,
-        text_encoder3=model.text_encoder3,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
         prompts=prompts,
         device=device,
         debug=args.debug
     )
     if args.debug:
-        logger.debug(f"Conditional prompt_embeds shape: {prompt_embeds.shape}, pooled_prompt shape: {pooled_prompt.shape}")
+        logger.debug(f"Conditional prompt_embeds shape: {prompt_embeds.shape}")
 
     logger.info("Encoding unconditional (empty) prompt...")
     uncond_prompt = [""] * B
-    prompt_embeds_uncond, pooled_prompt_uncond = encode_prompt(
+    prompt_embeds_uncond = encode_prompt(
         model=model,
-        tokenizer1=model.tokenizer1,
-        text_encoder1=model.text_encoder1,
-        tokenizer2=model.tokenizer2,
-        text_encoder2=model.text_encoder2,
-        tokenizer3=model.tokenizer3,
-        text_encoder3=model.text_encoder3,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
         prompts=uncond_prompt,
         device=device,
         debug=args.debug
@@ -141,7 +145,7 @@ def main():
 
     # Prepare initial latents
     logger.info("Initializing latents for inference...")
-    latents = prepare_latents(B, args.height, args.width, device=device)  # [B,20,h/8,w/8]
+    latents = prepare_latents(B, args.height, args.width, device=device)  # [B,4,h/8,w/8]
     if args.debug:
         logger.debug(f"Initial latents shape: {latents.shape}")
 
@@ -153,7 +157,7 @@ def main():
 
     for i, t in enumerate(scheduler.timesteps):
         # Duplicate latents for uncond + cond
-        latent_model_input = torch.cat([latents, latents], dim=0)  # [2*B,20,...]
+        latent_model_input = torch.cat([latents, latents], dim=0)  # [2*B,4,...]
         # Prepare timesteps tensor
         if isinstance(t, torch.Tensor):
             timestep = t.expand(latent_model_input.shape[0])
@@ -161,7 +165,6 @@ def main():
             timestep = torch.tensor([t] * latent_model_input.shape[0], device=device)
         # Prepare embeddings
         encoder_states = torch.cat([prompt_embeds_uncond, prompt_embeds], dim=0)
-        pooled_states = torch.cat([pooled_prompt_uncond, pooled_prompt], dim=0)
         # Prepare control inputs
         control_inputs = torch.cat([control_input_uncond, control_input], dim=0)
 
@@ -169,29 +172,28 @@ def main():
             logger.debug(f"Step {i+1}/{num_steps}, timestep {t}: latent_model_input shape {latent_model_input.shape}")
 
         # ControlNet forward
-        control_block = model.controlnet(
-            hidden_states=latent_model_input,
+        down_block_res_samples, mid_block_res_sample = model.controlnet(
+            sample=latent_model_input,
             timestep=timestep,
             encoder_hidden_states=encoder_states,
-            pooled_projections=pooled_states,
             controlnet_cond=control_inputs,
             conditioning_scale=1.0,
-            return_dict=False,
-        )[0]
+            return_dict=False
+        )
         if args.debug:
-            logger.debug(f"ControlNet output shape: {control_block.shape}")
+            logger.debug(f"ControlNet output: {len(down_block_res_samples)} down blocks")
 
-        # Transformer forward
-        noise_pred = model.transformer(
-            hidden_states=latent_model_input,
+        # UNet forward
+        noise_pred = model.unet(
+            sample=latent_model_input,
             timestep=timestep,
             encoder_hidden_states=encoder_states,
-            pooled_projections=pooled_states,
-            block_controlnet_hidden_states=control_block,
-            return_dict=False,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
+            return_dict=False
         )[0]
         if args.debug:
-            logger.debug(f"Transformer output (noise_pred) shape: {noise_pred.shape}")
+            logger.debug(f"UNet output (noise_pred) shape: {noise_pred.shape}")
 
         # Split uncond/cond
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
@@ -203,10 +205,10 @@ def main():
         if args.debug:
             logger.debug(f"After scheduler.step: latents shape: {latents.shape}")
 
-    # Decode try-on image from first 16 channels
+    # Decode try-on image from latents (4 channels for SD1.5)
     logger.info("Decoding final image from latents...")
-    tryon_latents = latents[:, :16, :, :]  # [B,16,h/8,w/8]
-    tryon_latents = (tryon_latents / model.vae.config.scaling_factor) + model.vae.config.shift_factor
+    tryon_latents = latents  # [B,4,h/8,w/8]
+    tryon_latents = tryon_latents / model.vae.config.scaling_factor
     tryon_latents = tryon_latents.to(dtype=model.vae.dtype)
     with torch.no_grad():
         decoded = model.vae.decode(tryon_latents, return_dict=False)[0]  # [B,3,H,W]

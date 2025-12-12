@@ -81,14 +81,14 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    # Instantiate DeepFit student (20-channel config)
+    # Instantiate DeepFit student (SD1.5 config)
     student = DeepFit(
         device=device,
         debug=args.debug,
-        transformer_in_channels=20,
-        transformer_out_channels=20,
-        controlnet_in_latent_channels=20,
-        controlnet_cond_channels=33
+        unet_in_channels=13,
+        unet_out_channels=4,
+        controlnet_in_channels=13,
+        controlnet_cond_channels=9
     )
     # Load student state_dict
     sd = torch.load(args.student_ckpt, map_location=device)

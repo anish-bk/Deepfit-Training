@@ -263,15 +263,18 @@ class DeepFit(nn.Module):
     """
     DeepFit model: loads VAE, UNet & ControlNet for SD1.5 Inpainting.
     Assumes prompt embeddings are provided by the dataset, so no tokenizers or text encoders are needed here.
+    
+    ControlNet conditioning is in pixel space (7 channels: 3 person RGB + 1 mask + 3 clothing RGB).
+    The controlnet_cond_embedding internally downsamples from pixel space to latent space.
     """
     def __init__(
         self,
         device: str = "cuda",
         debug: bool = False,
-        unet_in_channels: int = 13,  # SD1.5 inpainting: 4 latent + 4 masked latent + 1 mask + 4 clothing latent = 13
+        unet_in_channels: int = 4,   # SD1.5 standard: 4 latent channels
         unet_out_channels: int = 4,
-        controlnet_in_channels: int = 13,
-        controlnet_cond_channels: int = 9  # person latent (4) + mask (1) + clothing latent (4)
+        controlnet_in_channels: int = 4,  # Same as UNet (latent space)
+        controlnet_cond_channels: int = 7  # Pixel space: person RGB (3) + mask (1) + clothing RGB (3)
     ):
         super().__init__()
         self.device = device
@@ -286,21 +289,16 @@ class DeepFit(nn.Module):
             torch_dtype=torch.float16
         ).to(device)
 
-        # 2. Load and modify UNet
+        # 2. Load UNet (standard SD1.5, no channel modification needed for 4-channel latents)
         if debug:
-            print("[DEBUG] Loading and modifying UNet...")
-        orig_unet = UNet2DConditionModel.from_pretrained(
-            "stable-diffusion-v1-5/stable-diffusion-inpainting",
+            print("[DEBUG] Loading UNet...")
+        self.unet = UNet2DConditionModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",  # Use standard SD1.5 UNet with 4 input channels
             subfolder="unet",
             torch_dtype=torch.float16
         ).to(device)
-        self.unet = modify_unet_channels(
-            unet=orig_unet,
-            new_in_channels=unet_in_channels,
-            device=device
-        )
 
-        # 3. Load and modify ControlNet
+        # 3. Load and modify ControlNet conditioning channels
         if debug:
             print("[DEBUG] Loading and modifying ControlNet...")
         orig_cn = ControlNetModel.from_pretrained(

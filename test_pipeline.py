@@ -8,6 +8,7 @@ Comprehensive test script to verify the entire DeepFit pipeline:
 3. Training step
 4. Inference
 5. Distillation
+6. Dataloader
 
 Usage:
     python test_pipeline.py --test all
@@ -15,6 +16,7 @@ Usage:
     python test_pipeline.py --test train
     python test_pipeline.py --test inference
     python test_pipeline.py --test distill
+    python test_pipeline.py --test dataloader
 """
 
 import os
@@ -24,13 +26,151 @@ import logging
 import torch
 import torch.nn.functional as F
 import numpy as np
+import cv2
 from PIL import Image
 import tempfile
 import shutil
+import torchvision.transforms as transforms
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# ---------------------- DATASET CONFIGURATION ----------------------
+# Path to the test dataset folder
+DATASET_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
+IMAGE_SIZE = (512, 512)
+
+# Transforms matching the dataloader
+transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+depth_transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(0.5, 0.5)
+])
+
+basic_transform = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.ToTensor()
+])
+
+
+def load_test_sample(sample_idx=0):
+    """
+    Load a sample from the test dataset.
+    
+    Returns a dictionary with:
+        - person_image: (3, H, W) tensor normalized to [-1, 1]
+        - cloth_image: (3, H, W) tensor normalized to [-1, 1]
+        - normal_map: (3, H, W) tensor normalized to [-1, 1]
+        - depth_map: (1, H, W) tensor normalized to [-1, 1]
+        - mask: (1, H, W) tensor in [0, 1]
+        - overlay_image: (3, H, W) tensor with masked region grayed out
+        - caption: string
+        - filename: base filename
+    """
+    # List available samples
+    image_dir = os.path.join(DATASET_ROOT, "image")
+    if not os.path.isdir(image_dir):
+        raise FileNotFoundError(f"Dataset not found at {DATASET_ROOT}. Please ensure the 'dataset' folder exists.")
+    
+    # Get all _0 images (person images)
+    person_files = sorted([f for f in os.listdir(image_dir) if f.endswith("_0.jpg")])
+    if len(person_files) == 0:
+        raise FileNotFoundError(f"No person images found in {image_dir}")
+    
+    if sample_idx >= len(person_files):
+        sample_idx = sample_idx % len(person_files)
+    
+    # Get base name (e.g., "020714")
+    base_name = person_files[sample_idx].replace("_0.jpg", "")
+    logger.info(f"Loading test sample: {base_name}")
+    
+    # Build paths
+    person_path = os.path.join(DATASET_ROOT, "image", f"{base_name}_0.jpg")
+    cloth_path = os.path.join(DATASET_ROOT, "cloth", f"{base_name}_1.jpg")
+    normal_path = os.path.join(DATASET_ROOT, "normal", f"{base_name}_0.jpg")
+    depth_path = os.path.join(DATASET_ROOT, "depth", f"{base_name}_0.jpg")
+    mask_path = os.path.join(DATASET_ROOT, "mask", f"{base_name}_0.png")
+    caption_path = os.path.join(DATASET_ROOT, "caption", f"{base_name}_0.txt")
+    
+    # Verify files exist
+    for path, name in [(person_path, "person"), (cloth_path, "cloth"), 
+                        (normal_path, "normal"), (depth_path, "depth"),
+                        (mask_path, "mask")]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Missing {name} file: {path}")
+    
+    # Load images
+    person_pil = Image.open(person_path).convert("RGB")
+    cloth_pil = Image.open(cloth_path).convert("RGB")
+    normal_pil = Image.open(normal_path).convert("RGB")
+    depth_pil = Image.open(depth_path).convert("L")
+    mask_pil = Image.open(mask_path).convert("L")
+    
+    # Create overlay (gray out masked region)
+    person_np = np.array(person_pil.resize(IMAGE_SIZE))
+    mask_np = np.array(mask_pil.resize(IMAGE_SIZE))
+    blurred = cv2.GaussianBlur(mask_np, (21, 21), sigmaX=10)
+    alpha = np.expand_dims(blurred.astype(np.float32) / 255.0, 2)
+    grey = np.full_like(person_np, 128, np.uint8)
+    overlay_np = (person_np * (1 - alpha) + grey * alpha).astype(np.uint8)
+    overlay_pil = Image.fromarray(overlay_np)
+    
+    # Apply transforms
+    person_image = transform(person_pil)
+    cloth_image = transform(cloth_pil)
+    normal_map = transform(normal_pil)
+    depth_map = depth_transform(depth_pil)
+    mask_tensor = basic_transform(mask_pil)
+    overlay_image = transform(overlay_pil)
+    
+    # Load caption
+    caption = ""
+    if os.path.isfile(caption_path):
+        with open(caption_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+    
+    return {
+        "person_image": person_image,
+        "cloth_image": cloth_image,
+        "normal_map": normal_map,
+        "depth_map": depth_map,
+        "mask": mask_tensor,
+        "overlay_image": overlay_image,
+        "caption": caption,
+        "filename": base_name
+    }
+
+
+def load_test_batch(batch_size=2, device="cuda", dtype=torch.float16):
+    """
+    Load a batch of samples from the test dataset.
+    
+    Returns tensors ready for model input.
+    """
+    samples = []
+    for i in range(batch_size):
+        samples.append(load_test_sample(i))
+    
+    # Stack into batches
+    batch = {
+        "person_image": torch.stack([s["person_image"] for s in samples]).to(device, dtype=dtype),
+        "cloth_image": torch.stack([s["cloth_image"] for s in samples]).to(device, dtype=dtype),
+        "normal_map": torch.stack([s["normal_map"] for s in samples]).to(device, dtype=dtype),
+        "depth_map": torch.stack([s["depth_map"] for s in samples]).to(device, dtype=dtype),
+        "mask": torch.stack([s["mask"] for s in samples]).to(device, dtype=dtype),
+        "overlay_image": torch.stack([s["overlay_image"] for s in samples]).to(device, dtype=dtype),
+        "captions": [s["caption"] for s in samples],
+        "filenames": [s["filename"] for s in samples]
+    }
+    
+    return batch
 
 
 def test_model_instantiation():
@@ -86,13 +226,14 @@ def test_model_instantiation():
 
 
 def test_forward_pass(model=None):
-    """Test 2: Forward pass with dummy data."""
+    """Test 2: Forward pass with real dataset images."""
     logger.info("=" * 60)
-    logger.info("TEST 2: Forward Pass")
+    logger.info("TEST 2: Forward Pass (Real Data)")
     logger.info("=" * 60)
     
     try:
         from model import DeepFit
+        from utils import prepare_control_input
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
@@ -100,22 +241,33 @@ def test_forward_pass(model=None):
             model = DeepFit(device=device, debug=False).to(device)
         model.eval()
         
-        # Create dummy inputs
-        B = 1
-        H, W = 64, 64  # Small size for testing
-        h, w = H // 8, W // 8  # Latent size
+        # Load real test sample
+        logger.info("Loading real test sample from dataset...")
+        sample = load_test_sample(0)
         
-        logger.info(f"Creating dummy inputs: batch={B}, latent_size={h}x{w}")
+        # Add batch dimension
+        overlay = sample["overlay_image"].unsqueeze(0).to(device, dtype=torch.float16)
+        mask = sample["mask"].unsqueeze(0).to(device, dtype=torch.float16)
+        cloth = sample["cloth_image"].unsqueeze(0).to(device, dtype=torch.float16)
         
-        # Dummy tensors
+        logger.info(f"  - Loaded sample: {sample['filename']}")
+        logger.info(f"  - Caption: {sample['caption'][:80]}...")
+        
+        # Prepare control input using VAE
+        with torch.no_grad():
+            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, debug=False)
+        
+        B, _, h, w = ctrl.shape
+        logger.info(f"  - Control input shape: {ctrl.shape}")
+        
+        # Create noisy latents and prompt embeddings
         noisy_latents = torch.randn(B, 4, h, w, device=device, dtype=torch.float16)
         timesteps = torch.randint(0, 1000, (B,), device=device, dtype=torch.long)
-        control_input = torch.randn(B, 9, h, w, device=device, dtype=torch.float16)
         prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
         
         logger.info("Running forward pass...")
         with torch.no_grad():
-            output = model(noisy_latents, timesteps, control_input, prompt_embeds)
+            output = model(noisy_latents, timesteps, ctrl, prompt_embeds)
         
         # Verify output shape
         expected_shape = (B, 4, h, w)
@@ -135,9 +287,9 @@ def test_forward_pass(model=None):
 
 
 def test_training_step():
-    """Test 3: Single training step with dummy data."""
+    """Test 3: Single training step with real dataset images."""
     logger.info("=" * 60)
-    logger.info("TEST 3: Training Step")
+    logger.info("TEST 3: Training Step (Real Data)")
     logger.info("=" * 60)
     
     try:
@@ -158,25 +310,34 @@ def test_training_step():
         
         optimizer = setup_optimizer(model, lr=1e-5)
         
-        # Create dummy batch
-        B = 1
-        H, W = 64, 64  # Small size for testing
+        # Load real batch
+        logger.info("Loading real training batch from dataset...")
+        batch = load_test_batch(batch_size=2, device=device, dtype=torch.float16)
         
-        logger.info(f"Creating dummy training batch: {B}x3x{H}x{W}")
-        
-        # Dummy images (normalized to [-1, 1])
-        overlay = torch.randn(B, 3, H, W, device=device, dtype=torch.float16)
-        mask = torch.rand(B, 1, H, W, device=device, dtype=torch.float16)
-        cloth = torch.randn(B, 3, H, W, device=device, dtype=torch.float16)
-        depth = torch.randn(B, 1, H, W, device=device, dtype=torch.float16)
-        normal = torch.randn(B, 3, H, W, device=device, dtype=torch.float16)
-        prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
+        logger.info(f"  - Loaded samples: {batch['filenames']}")
+        logger.info(f"  - Image shape: {batch['overlay_image'].shape}")
         
         # Prepare inputs
         logger.info("Preparing control and target latents...")
         with torch.no_grad():
-            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, debug=False)
-            tgt = prepare_target_latents(overlay, depth, normal, model.vae, debug=False)
+            ctrl = prepare_control_input(
+                batch["overlay_image"], 
+                batch["mask"], 
+                batch["cloth_image"], 
+                model.vae, 
+                debug=False
+            )
+            tgt = prepare_target_latents(
+                batch["overlay_image"], 
+                batch["depth_map"], 
+                batch["normal_map"], 
+                model.vae, 
+                debug=False
+            )
+        
+        # Create prompt embeddings (random for now, real encoding tested in inference)
+        B = batch["overlay_image"].shape[0]
+        prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
         
         # Add noise
         noised, noise, t = add_noise(tgt, debug=False)
@@ -212,9 +373,9 @@ def test_training_step():
 
 
 def test_inference():
-    """Test 4: Full inference pipeline."""
+    """Test 4: Full inference pipeline with real dataset images."""
     logger.info("=" * 60)
-    logger.info("TEST 4: Inference Pipeline")
+    logger.info("TEST 4: Inference Pipeline (Real Data)")
     logger.info("=" * 60)
     
     try:
@@ -241,18 +402,23 @@ def test_inference():
             torch_dtype=torch.float16
         ).to(device)
         
-        # Create dummy inputs
+        # Load real test sample
+        logger.info("Loading real test sample from dataset...")
+        sample = load_test_sample(0)
+        
+        # Add batch dimension
+        overlay = sample["overlay_image"].unsqueeze(0).to(device, dtype=torch.float16)
+        mask = sample["mask"].unsqueeze(0).to(device, dtype=torch.float16)
+        cloth = sample["cloth_image"].unsqueeze(0).to(device, dtype=torch.float16)
+        
         B = 1
-        H, W = 64, 64  # Small size for testing
+        H, W = IMAGE_SIZE
         
-        logger.info(f"Creating dummy inference inputs...")
+        logger.info(f"  - Sample: {sample['filename']}")
+        logger.info(f"  - Caption: {sample['caption'][:80]}...")
         
-        person = torch.rand(B, 3, H, W, device=device, dtype=torch.float16)
-        mask = torch.rand(B, 1, H, W, device=device, dtype=torch.float16)
-        clothing = torch.rand(B, 3, H, W, device=device, dtype=torch.float16)
-        
-        # Encode prompt
-        prompt = ["a person wearing clothes"]
+        # Encode real caption
+        prompt = [sample["caption"]] if sample["caption"] else ["a person wearing clothes"]
         prompt_embeds = encode_prompt(
             model=model,
             tokenizer=tokenizer,
@@ -260,16 +426,19 @@ def test_inference():
             prompts=prompt,
             device=device
         )
+        logger.info(f"  - Prompt embeddings shape: {prompt_embeds.shape}")
         
         # Prepare control input
         with torch.no_grad():
-            control_input = prepare_control_input(person, mask, clothing, model.vae, debug=False)
+            control_input = prepare_control_input(overlay, mask, cloth, model.vae, debug=False)
+        logger.info(f"  - Control input shape: {control_input.shape}")
         
         # Initialize latents
         latents = prepare_latents(B, H, W, device=device)
+        logger.info(f"  - Initial latents shape: {latents.shape}")
         
         # Run a few denoising steps (not full inference for speed)
-        num_steps = 5
+        num_steps = 10
         scheduler = model.scheduler
         scheduler.set_timesteps(num_steps)
         
@@ -309,11 +478,24 @@ def test_inference():
             decoded = model.vae.decode(latents_scaled, return_dict=False)[0]
         
         # Verify output
-        assert decoded.shape == (B, 3, H, W), f"Unexpected output shape: {decoded.shape}"
+        expected_shape = (B, 3, H, W)
+        assert decoded.shape == expected_shape, f"Unexpected output shape: {decoded.shape}"
+        
+        # Save output image for visual verification
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_outputs")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert to PIL and save
+        output_image = ((decoded[0].cpu().float().clamp(-1, 1) + 1) / 2 * 255).to(torch.uint8)
+        output_image = output_image.permute(1, 2, 0).numpy()
+        output_pil = Image.fromarray(output_image)
+        output_path = os.path.join(output_dir, f"inference_test_{sample['filename']}.png")
+        output_pil.save(output_path)
         
         logger.info(f"✓ Inference pipeline successful")
         logger.info(f"  - Final latents shape: {latents.shape}")
         logger.info(f"  - Decoded image shape: {decoded.shape}")
+        logger.info(f"  - Output saved to: {output_path}")
         
         return True
         
@@ -325,13 +507,14 @@ def test_inference():
 
 
 def test_distillation():
-    """Test 5: Distillation components."""
+    """Test 5: Distillation components with real dataset images."""
     logger.info("=" * 60)
-    logger.info("TEST 5: Distillation Components")
+    logger.info("TEST 5: Distillation Components (Real Data)")
     logger.info("=" * 60)
     
     try:
         from model import DeepFit
+        from utils import prepare_control_input
         from distillation.distill_utils import (
             LatentDiscriminator,
             ConsistencySampler,
@@ -394,20 +577,32 @@ def test_distillation():
         logger.info(f"  - Lambda ADV: {wrapper.lambda_adv}")
         logger.info(f"  - Lambda Consistency: {wrapper.lambda_consistency}")
         
-        # Test forward pass through discriminator
-        logger.info("Testing discriminator forward pass...")
-        B = 1
-        h, w = 8, 8
+        # Load real test sample for discriminator test
+        logger.info("Loading real test sample for discriminator test...")
+        sample = load_test_sample(0)
+        
+        overlay = sample["overlay_image"].unsqueeze(0).to(device, dtype=torch.float16)
+        mask = sample["mask"].unsqueeze(0).to(device, dtype=torch.float16)
+        cloth = sample["cloth_image"].unsqueeze(0).to(device, dtype=torch.float16)
+        
+        # Prepare control input
+        with torch.no_grad():
+            control_input = prepare_control_input(overlay, mask, cloth, student.vae, debug=False)
+        
+        B, _, h, w = control_input.shape
         noisy_latents = torch.randn(B, 4, h, w, device=device, dtype=torch.float16)
         prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
-        control_input = torch.randn(B, 9, h, w, device=device, dtype=torch.float16)
         
+        logger.info("Testing discriminator forward pass with real data...")
         with torch.no_grad():
             scores = discriminator(noisy_latents, prompt_embeds, control_input)
         
         assert scores.shape == (B, 1), f"Unexpected discriminator output shape: {scores.shape}"
         logger.info(f"✓ Discriminator forward pass successful")
+        logger.info(f"  - Input sample: {sample['filename']}")
+        logger.info(f"  - Control input shape: {control_input.shape}")
         logger.info(f"  - Output shape: {scores.shape}")
+        logger.info(f"  - Score: {scores.item():.4f}")
         
         return True
         
@@ -466,13 +661,190 @@ def test_utils():
         return False
 
 
+def test_dataloader():
+    """Test 7: Dataloader with real dataset."""
+    logger.info("=" * 60)
+    logger.info("TEST 7: Dataloader (Real Dataset)")
+    logger.info("=" * 60)
+    
+    try:
+        from torch.utils.data import DataLoader, Dataset
+        
+        # Create a simple test dataset that matches our folder structure
+        # Our dataset has: image/*_0.jpg, cloth/*_1.jpg, mask/*_0.png, etc.
+        logger.info(f"Testing custom TestDataset with: {DATASET_ROOT}")
+        
+        if not os.path.isdir(DATASET_ROOT):
+            raise FileNotFoundError(f"Dataset not found at {DATASET_ROOT}")
+        
+        class TestDataset(Dataset):
+            """Test dataset matching our specific folder structure."""
+            def __init__(self, root_dir):
+                self.root_dir = root_dir
+                image_dir = os.path.join(root_dir, "image")
+                # Get all _0 images (person images)
+                self.samples = sorted([
+                    f.replace("_0.jpg", "") 
+                    for f in os.listdir(image_dir) 
+                    if f.endswith("_0.jpg")
+                ])
+                logger.info(f"  - Found {len(self.samples)} samples")
+            
+            def __len__(self):
+                return len(self.samples)
+            
+            def __getitem__(self, idx):
+                base = self.samples[idx]
+                
+                # Load images with correct naming convention
+                person_pil = Image.open(os.path.join(self.root_dir, "image", f"{base}_0.jpg")).convert("RGB")
+                cloth_pil = Image.open(os.path.join(self.root_dir, "cloth", f"{base}_1.jpg")).convert("RGB")
+                normal_pil = Image.open(os.path.join(self.root_dir, "normal", f"{base}_0.jpg")).convert("RGB")
+                depth_pil = Image.open(os.path.join(self.root_dir, "depth", f"{base}_0.jpg")).convert("L")
+                mask_pil = Image.open(os.path.join(self.root_dir, "mask", f"{base}_0.png")).convert("L")
+                
+                # Create overlay
+                person_np = np.array(person_pil.resize(IMAGE_SIZE))
+                mask_np = np.array(mask_pil.resize(IMAGE_SIZE))
+                blurred = cv2.GaussianBlur(mask_np, (21, 21), sigmaX=10)
+                alpha = np.expand_dims(blurred.astype(np.float32) / 255.0, 2)
+                grey = np.full_like(person_np, 128, np.uint8)
+                overlay_np = (person_np * (1 - alpha) + grey * alpha).astype(np.uint8)
+                overlay_pil = Image.fromarray(overlay_np)
+                
+                # Load caption
+                caption_path = os.path.join(self.root_dir, "caption", f"{base}_0.txt")
+                caption = ""
+                if os.path.isfile(caption_path):
+                    with open(caption_path, "r", encoding="utf-8") as f:
+                        caption = f.read().strip()
+                
+                return {
+                    "person_image": transform(person_pil),
+                    "cloth_image": transform(cloth_pil),
+                    "normal_map": transform(normal_pil),
+                    "depth_map": depth_transform(depth_pil),
+                    "mask": basic_transform(mask_pil),
+                    "overlay_image": transform(overlay_pil),
+                    "caption": caption,
+                    "filename": base
+                }
+        
+        dataset = TestDataset(DATASET_ROOT)
+        logger.info(f"  - Dataset size: {len(dataset)} samples")
+        
+        # Test getting a single sample
+        logger.info("Testing single sample retrieval...")
+        sample = dataset[0]
+        
+        # Verify sample structure
+        expected_keys = ["person_image", "cloth_image", "normal_map", "depth_map", 
+                         "mask", "overlay_image", "caption", "filename"]
+        for key in expected_keys:
+            assert key in sample, f"Missing key: {key}"
+        
+        logger.info("  Sample contents:")
+        logger.info(f"    - filename: {sample['filename']}")
+        logger.info(f"    - person_image: {sample['person_image'].shape}")
+        logger.info(f"    - cloth_image: {sample['cloth_image'].shape}")
+        logger.info(f"    - normal_map: {sample['normal_map'].shape}")
+        logger.info(f"    - depth_map: {sample['depth_map'].shape}")
+        logger.info(f"    - mask: {sample['mask'].shape}")
+        logger.info(f"    - overlay_image: {sample['overlay_image'].shape}")
+        logger.info(f"    - caption: {sample['caption'][:60]}...")
+        
+        # Verify tensor shapes
+        assert sample["person_image"].shape == (3, 512, 512), f"Unexpected person_image shape"
+        assert sample["cloth_image"].shape == (3, 512, 512), f"Unexpected cloth_image shape"
+        assert sample["mask"].shape == (1, 512, 512), f"Unexpected mask shape"
+        
+        # Test DataLoader
+        logger.info("Testing DataLoader batch loading...")
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+        
+        batch = next(iter(dataloader))
+        logger.info(f"  - Batch size: {batch['person_image'].shape[0]}")
+        logger.info(f"  - Person image batch: {batch['person_image'].shape}")
+        logger.info(f"  - Cloth image batch: {batch['cloth_image'].shape}")
+        
+        # Verify batch shapes
+        assert batch["person_image"].shape == (2, 3, 512, 512), f"Unexpected batch shape"
+        
+        logger.info("✓ Dataloader test successful")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Dataloader test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_dataset_loading():
+    """Test 8: Test the load_test_sample and load_test_batch functions."""
+    logger.info("=" * 60)
+    logger.info("TEST 8: Dataset Loading Functions")
+    logger.info("=" * 60)
+    
+    try:
+        # Test load_test_sample
+        logger.info("Testing load_test_sample...")
+        sample = load_test_sample(0)
+        
+        expected_keys = ["person_image", "cloth_image", "normal_map", "depth_map", 
+                         "mask", "overlay_image", "caption", "filename"]
+        for key in expected_keys:
+            assert key in sample, f"Missing key: {key}"
+        
+        logger.info(f"  - Sample loaded: {sample['filename']}")
+        logger.info(f"  - Person image: {sample['person_image'].shape}")
+        logger.info(f"  - Cloth image: {sample['cloth_image'].shape}")
+        logger.info(f"  - Mask: {sample['mask'].shape}")
+        logger.info(f"  - Caption: {sample['caption'][:60]}...")
+        
+        # Test load_test_batch
+        logger.info("Testing load_test_batch...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        batch = load_test_batch(batch_size=3, device=device, dtype=torch.float16)
+        
+        assert batch["person_image"].shape[0] == 3, "Batch size mismatch"
+        logger.info(f"  - Batch loaded with {len(batch['filenames'])} samples")
+        logger.info(f"  - Filenames: {batch['filenames']}")
+        logger.info(f"  - Person image batch: {batch['person_image'].shape}")
+        logger.info(f"  - Device: {batch['person_image'].device}")
+        logger.info(f"  - Dtype: {batch['person_image'].dtype}")
+        
+        # List all available samples
+        image_dir = os.path.join(DATASET_ROOT, "image")
+        person_files = sorted([f for f in os.listdir(image_dir) if f.endswith("_0.jpg")])
+        logger.info(f"  - Total samples available: {len(person_files)}")
+        
+        logger.info("✓ Dataset loading functions test successful")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Dataset loading test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def run_all_tests():
     """Run all tests and report results."""
     logger.info("\n" + "=" * 60)
-    logger.info("DEEPFIT PIPELINE TEST SUITE")
-    logger.info("=" * 60 + "\n")
+    logger.info("DEEPFIT PIPELINE TEST SUITE (with Real Dataset)")
+    logger.info("=" * 60)
+    logger.info(f"Dataset path: {DATASET_ROOT}\n")
     
     results = {}
+    
+    # Test 8: Dataset loading (run first to validate dataset)
+    results["Dataset Loading"] = test_dataset_loading()
+    print()
+    
+    # Test 7: Dataloader
+    results["Dataloader"] = test_dataloader()
+    print()
     
     # Test 1: Model instantiation
     success, model = test_model_instantiation()
@@ -527,20 +899,27 @@ def run_all_tests():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Test DeepFit pipeline")
+    parser = argparse.ArgumentParser(description="Test DeepFit pipeline with real dataset")
     parser.add_argument(
         "--test",
         type=str,
         default="all",
-        choices=["all", "model", "forward", "train", "inference", "distill", "utils"],
+        choices=["all", "model", "forward", "train", "inference", "distill", "utils", "dataloader", "dataset"],
         help="Which test to run"
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument("--dataset", type=str, default=None, help="Path to dataset folder (optional)")
     return parser.parse_args()
 
 
 def main():
+    global DATASET_ROOT
     args = parse_args()
+    
+    # Override dataset path if provided
+    if args.dataset:
+        DATASET_ROOT = args.dataset
+        logger.info(f"Using custom dataset path: {DATASET_ROOT}")
     
     if args.test == "all":
         return run_all_tests()
@@ -557,6 +936,10 @@ def main():
         return 0 if test_distillation() else 1
     elif args.test == "utils":
         return 0 if test_utils() else 1
+    elif args.test == "dataloader":
+        return 0 if test_dataloader() else 1
+    elif args.test == "dataset":
+        return 0 if test_dataset_loading() else 1
 
 
 if __name__ == "__main__":

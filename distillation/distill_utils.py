@@ -91,7 +91,8 @@ class LatentDiscriminator(nn.Module):
                 nn.LeakyReLU(0.2, inplace=True),
                 nn.Linear(self.proj_hidden_dim, 1)
             )
-            self.proj_heads[str(idx)] = head.to(device)
+            # Match the dtype of the input features (e.g., float16)
+            self.proj_heads[str(idx)] = head.to(device=device, dtype=feat.dtype)
         self.initialized = True
         logger.info(f"[LatentDiscriminator] Initialized projection heads for layers {self.feature_layers}")
 

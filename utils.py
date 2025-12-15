@@ -258,17 +258,25 @@ def encode_modality(vae: AutoencoderKL, x: torch.Tensor, debug: bool = False) ->
 
 
 def prepare_control_input(person_images: torch.Tensor, masks: torch.Tensor, clothing_images: torch.Tensor,
-                          vae: AutoencoderKL, debug: bool = False) -> torch.Tensor:
+                          vae: AutoencoderKL = None, debug: bool = False) -> torch.Tensor:
     """
-    Encode person_images and clothing_images via VAE, resize mask, then concat → [B,9,h/8,w/8] for SD1.5.
-    (4 person latent + 1 mask + 4 clothing latent = 9 channels)
+    Prepare control conditioning in PIXEL space for SD1.5 ControlNet.
+    ControlNet expects conditioning at original image resolution (e.g., 512x512).
+    The ControlNet's internal controlnet_cond_embedding downsamples to latent space.
+    
+    Concatenates: person RGB (3) + mask (1) + clothing RGB (3) → [B, 7, H, W]
+    
+    Note: The vae parameter is kept for API compatibility but not used.
     """
-    person_latents = encode_modality(vae, person_images, debug=debug)  # [B,4,h/8,w/8]
-    clothing_latents = encode_modality(vae, clothing_images, debug=debug)  # [B,4,h/8,w/8]
-    mask_latents = F.interpolate(masks, size=person_latents.shape[-2:], mode='nearest')  # [B,1,h/8,w/8]
-    control_input = torch.cat([person_latents, mask_latents, clothing_latents], dim=1)  # [B,9,...]
+    # Ensure mask matches image dimensions
+    if masks.shape[-2:] != person_images.shape[-2:]:
+        masks = F.interpolate(masks, size=person_images.shape[-2:], mode='nearest')
+    
+    # Concatenate in pixel space: [B, 3+1+3, H, W] = [B, 7, H, W]
+    control_input = torch.cat([person_images, masks, clothing_images], dim=1)
+    
     if debug:
-        logger.debug(f"[DEBUG] Control input shape: {control_input.shape}")
+        logger.debug(f"[DEBUG] Control input shape (pixel space): {control_input.shape}")
     return control_input
 
 

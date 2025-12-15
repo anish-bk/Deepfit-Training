@@ -136,9 +136,9 @@ def main():
     if args.debug:
         logger.debug(f"Unconditional prompt_embeds shape: {prompt_embeds_uncond.shape}")
 
-    # Prepare control inputs
-    logger.info("Preparing control input...")
-    control_input = prepare_control_input(person, mask, clothing, vae=model.vae, debug=args.debug)
+    # Prepare control inputs in pixel space (ControlNet internally downsamples)
+    logger.info("Preparing control input (pixel space)...")
+    control_input = prepare_control_input(person, mask, clothing, debug=args.debug)
     control_input_uncond = torch.zeros_like(control_input)
     if args.debug:
         logger.debug(f"Control input shape: {control_input.shape}, Uncond control input shape: {control_input_uncond.shape}")

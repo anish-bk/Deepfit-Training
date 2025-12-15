@@ -148,8 +148,8 @@ def main():
             pe      = batch["prompt_embeds"].to(device, dtype=torch.float16)
             pp      = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
-            # Forward
-            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, args.debug)
+            # Forward: control input in pixel space, target latents via VAE
+            ctrl = prepare_control_input(overlay, mask, cloth, debug=args.debug)
             tgt  = prepare_target_latents(overlay, depth, normal, model.vae, args.debug)
             noised, noise, t = add_noise(tgt, args.debug)
             noised = noised.to(device, dtype=torch.float16)
@@ -205,7 +205,7 @@ def main():
                 pe      = batch["prompt_embeds"].to(device, dtype=torch.float16)
                 pp      = batch["pooled_prompt"].to(device, dtype=torch.float16)
 
-                ctrl = prepare_control_input(overlay, mask, cloth, model.vae, False)
+                ctrl = prepare_control_input(overlay, mask, cloth, debug=False)
                 tgt  = prepare_target_latents(overlay, depth, normal, model.vae, False)
                 noised, noise, t = add_noise(tgt, False)
                 pred = model(noised, t, ctrl, pe, pp)

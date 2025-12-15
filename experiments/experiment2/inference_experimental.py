@@ -143,7 +143,7 @@ def main():
 
     # Prepare control input (unchanged)
     logger.info("Preparing control input...")
-    control_input = prepare_control_input(person, mask, clothing, vae=model.vae, debug=args.debug)
+    control_input = prepare_control_input(person, mask, clothing, debug=args.debug)
     control_input_uncond = torch.zeros_like(control_input)
     if args.debug:
         logger.debug(f"Control input shape: {control_input.shape}, Uncond control input shape: {control_input_uncond.shape}")

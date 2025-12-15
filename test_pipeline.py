@@ -185,15 +185,15 @@ def test_model_instantiation():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
         
-        # Instantiate model
+        # Instantiate model with pixel-space ControlNet conditioning
         logger.info("Instantiating DeepFit model...")
         model = DeepFit(
             device=device,
             debug=False,
-            unet_in_channels=13,
+            unet_in_channels=4,
             unet_out_channels=4,
-            controlnet_in_channels=13,
-            controlnet_cond_channels=9
+            controlnet_in_channels=4,
+            controlnet_cond_channels=7  # Pixel space: 3 person RGB + 1 mask + 3 clothing RGB
         )
         model.to(device)
         model.eval()
@@ -253,14 +253,15 @@ def test_forward_pass(model=None):
         logger.info(f"  - Loaded sample: {sample['filename']}")
         logger.info(f"  - Caption: {sample['caption'][:80]}...")
         
-        # Prepare control input using VAE
-        with torch.no_grad():
-            ctrl = prepare_control_input(overlay, mask, cloth, model.vae, debug=False)
+        # Prepare control input in pixel space (no VAE encoding)
+        ctrl = prepare_control_input(overlay, mask, cloth, debug=False)
         
-        B, _, h, w = ctrl.shape
-        logger.info(f"  - Control input shape: {ctrl.shape}")
+        B = ctrl.shape[0]
+        H, W = ctrl.shape[2], ctrl.shape[3]  # Pixel space dimensions (e.g., 512x512)
+        h, w = H // 8, W // 8  # Latent space dimensions (e.g., 64x64)
+        logger.info(f"  - Control input shape (pixel space): {ctrl.shape}")
         
-        # Create noisy latents and prompt embeddings
+        # Create noisy latents and prompt embeddings at latent resolution
         noisy_latents = torch.randn(B, 4, h, w, device=device, dtype=torch.float16)
         timesteps = torch.randint(0, 1000, (B,), device=device, dtype=torch.long)
         prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
@@ -269,7 +270,7 @@ def test_forward_pass(model=None):
         with torch.no_grad():
             output = model(noisy_latents, timesteps, ctrl, prompt_embeds)
         
-        # Verify output shape
+        # Verify output shape (latent space)
         expected_shape = (B, 4, h, w)
         assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
         
@@ -323,8 +324,7 @@ def test_training_step():
             ctrl = prepare_control_input(
                 batch["overlay_image"], 
                 batch["mask"], 
-                batch["cloth_image"], 
-                model.vae, 
+                batch["cloth_image"],
                 debug=False
             )
             tgt = prepare_target_latents(
@@ -430,8 +430,8 @@ def test_inference():
         
         # Prepare control input
         with torch.no_grad():
-            control_input = prepare_control_input(overlay, mask, cloth, model.vae, debug=False)
-        logger.info(f"  - Control input shape: {control_input.shape}")
+            control_input = prepare_control_input(overlay, mask, cloth, debug=False)
+        logger.info(f"  - Control input shape (pixel space): {control_input.shape}")
         
         # Initialize latents
         latents = prepare_latents(B, H, W, device=device)
@@ -528,19 +528,19 @@ def test_distillation():
         student = DeepFit(
             device=device,
             debug=False,
-            unet_in_channels=13,
+            unet_in_channels=4,
             unet_out_channels=4,
-            controlnet_in_channels=13,
-            controlnet_cond_channels=9
+            controlnet_in_channels=4,
+            controlnet_cond_channels=7  # Pixel space: 3 person RGB + 1 mask + 3 clothing RGB
         ).to(device)
         
         teacher = DeepFit(
             device=device,
             debug=False,
-            unet_in_channels=13,
+            unet_in_channels=4,
             unet_out_channels=4,
-            controlnet_in_channels=13,
-            controlnet_cond_channels=9
+            controlnet_in_channels=4,
+            controlnet_cond_channels=7
         ).to(device)
         teacher.load_state_dict(student.state_dict())
         teacher.eval()
@@ -585,11 +585,12 @@ def test_distillation():
         mask = sample["mask"].unsqueeze(0).to(device, dtype=torch.float16)
         cloth = sample["cloth_image"].unsqueeze(0).to(device, dtype=torch.float16)
         
-        # Prepare control input
-        with torch.no_grad():
-            control_input = prepare_control_input(overlay, mask, cloth, student.vae, debug=False)
+        # Prepare control input in pixel space (no VAE encoding)
+        control_input = prepare_control_input(overlay, mask, cloth, debug=False)
         
-        B, _, h, w = control_input.shape
+        B = control_input.shape[0]
+        H, W = control_input.shape[2], control_input.shape[3]  # Pixel space
+        h, w = H // 8, W // 8  # Latent space
         noisy_latents = torch.randn(B, 4, h, w, device=device, dtype=torch.float16)
         prompt_embeds = torch.randn(B, 77, 768, device=device, dtype=torch.float16)
         

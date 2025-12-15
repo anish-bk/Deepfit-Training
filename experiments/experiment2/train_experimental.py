@@ -154,7 +154,7 @@ def main():
                 B = person.size(0)
 
                 # 1. Prepare control input
-                control_input = prepare_control_input(overlay, mask, clothing, vae=model.vae, debug=args.debug)
+                control_input = prepare_control_input(overlay, mask, clothing, debug=args.debug)
 
                 # 2. Encode tryon_gt via VAE to image latents
                 with torch.no_grad():
@@ -209,7 +209,7 @@ def main():
                     if pooled_prompt is not None:
                         pooled_prompt = pooled_prompt.to(device, dtype=torch.float16)
 
-                    control_input = prepare_control_input(overlay, mask, clothing, vae=model.vae, debug=False)
+                    control_input = prepare_control_input(overlay, mask, clothing, debug=False)
                     latent_dist = model.vae.encode(tryon_gt).latent_dist
                     tryon_latents = (latent_dist.sample() - model.vae.config.shift_factor) * model.vae.config.scaling_factor
                     timesteps = torch.rand(overlay_image.size(0), device=device)
